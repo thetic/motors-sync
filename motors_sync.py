@@ -3,16 +3,41 @@
 # Copyright (C) 2024  Maksim Bolgov <maksim8024@gmail.com>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import os, logging, time, itertools
+import itertools
+import logging
+import os
+import time
 from datetime import datetime
+
 import numpy as np
+
 from . import z_tilt
 
 PLOT_PATH = '~/printer_data/config/adxl_results/motors_sync'
 PIN_MIN_TIME = 0.010            # Minimum wait time to enable hardware pin
 MOTOR_STALL_TIME = 0.100        # Minimum wait time to enable motor pin
-LEVELING_KINEMATICS = (         # Kinematics with interconnected axes
-    ['corexy', 'limited_corexy'])
+
+KINEMATICS = {
+    'corexy': {
+        'valid_axes': ['x', 'y'],
+        'joint_axes': {'x': ['y'], 'y': ['x']},
+        'do_level': True,
+        'default_method': 'alternately'
+    },
+    'cartesian': {
+        'valid_axes': ['x', 'y'],
+        'joint_axes': {},
+        'do_level': False,
+        'default_method': 'sequential'
+    },
+    'corexz': {
+        'valid_axes': ['y'],
+        'joint_axes': {},
+        'do_level': False,
+        'default_method': 'sequential'
+    }
+}
+KINEMATICS['limited_corexy'] = KINEMATICS['corexy']
 
 MATH_MODELS = {
     "polynomial": lambda fx, coeffs:
@@ -571,7 +596,7 @@ class MotorsSync:
         self.connect_tasks.clear()
 
     def _check_common_attr(self):
-        # Apply restrictions for LEVELING_KINEMATICS kinematics
+        # Apply restrictions for joint axes kinematics
         common_attr = ['microsteps', 'model_name', 'model_coeffs',
                        'max_step_size', 'axes_steps_diff']
         for attr in common_attr:
@@ -587,39 +612,37 @@ class MotorsSync:
                 f"different for a '{self.conf_kin}' kinematics")
 
     def _init_axes(self):
-        valid_axes = ['x', 'y']
         printer_section = self.config.getsection('printer')
         self.conf_kin = printer_section.get('kinematics')
-        if self.conf_kin in LEVELING_KINEMATICS:
-            self.do_level = True
-            axes = [a.lower() for a in self.config.getlist(
-                'axes', count=2, default=['x', 'y'])]
-            joint_ax = {'x': ['y'], 'y': ['x']}
-        elif self.conf_kin == 'cartesian':
-            self.do_level = False
-            axes = [a.lower() for a in self.config.getlist('axes')]
-            joint_ax = {}
-        else:
+
+        kinematics_settings = KINEMATICS.get(self.conf_kin)
+        if not kinematics_settings:
             raise self.config.error(f"motors_sync: Not supported "
                                     f"kinematics '{self.conf_kin}'")
-        if any(axis not in valid_axes for axis in axes):
+
+        self.do_level = kinematics_settings['do_level']
+        joint_ax = kinematics_settings['joint_axes']
+        axes = [a.lower() for a in self.config.getlist('axes')]
+
+        if any(axis not in kinematics_settings['valid_axes'] for axis in axes):
             raise self.config.error(f"motors_sync: Invalid axes "
                                     f"parameter '{','.join(axes)}'")
         self.motion = {ax: MotionAxis(self, ax, joint_ax) for ax in axes}
-        if self.conf_kin in LEVELING_KINEMATICS:
+        if joint_ax:
             self._check_common_attr()
 
     def _init_sync_method(self):
         methods = ['sequential', 'alternately', 'synchronous', 'default']
         self.sync_method = self.config.getchoice(
             'sync_method', {m: m for m in methods}, 'default')
+
         if self.sync_method == 'default':
-            if self.conf_kin in LEVELING_KINEMATICS:
-                self.sync_method = methods[1]
-            else:
-                self.sync_method = methods[0]
-        elif (self.sync_method in methods[1:]
-              and self.conf_kin not in LEVELING_KINEMATICS):
+            try:
+                self.sync_method = KINEMATICS[self.conf_kin]['default_method']
+            except KeyError as exc:
+                raise self.config.error(f"motors_sync: Not supported "
+                                        f"kinematics '{self.conf_kin}'") from exc
+        elif (self.sync_method in methods[1:]):
             raise self.config.error(
                 f"motors_sync: Invalid sync method: {self.sync_method} "
                 f"for '{self.conf_kin}' type kinematics")
